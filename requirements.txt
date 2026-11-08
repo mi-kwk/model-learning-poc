@@ -1,0 +1,6 @@
+# PyTorch は CPU 版を別に入れる:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 動作確認したバージョン: torch 2.15.0+cpu
+pygame==2.6.1
+matplotlib==3.11.2
+numpy==2.5.4
