@@ -54,6 +54,8 @@ def main() -> None:
     ap.add_argument("--compare", action="store_true", help="models/model_n*.pt をまとめて比べる")
     ap.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     ap.add_argument("--model-dir", type=Path, default=MODEL_DIR, help="--compare で探すフォルダ")
+    ap.add_argument("--greedy", action="store_true",
+                    help="くじ引きではなく、確率が最大の行動を必ず選ぶ（比較用）")
     args = ap.parse_args()
 
     if args.compare:
@@ -72,13 +74,16 @@ def main() -> None:
     for p in paths:
         model, meta = load_model(p)  # 保存したファイルから読み込み直して使う
         n = meta.get("num_demos", "?")
-        summaries.append(evaluate(f"手本{n}回", model_policy(model)))
+        summaries.append(evaluate(f"手本{n}回", model_policy(model, sample=not args.greedy)))
 
+    how = "確率が最大の行動を選ぶ" if args.greedy else "確率に従ってくじ引き（乱数の種は固定）"
     print(f"\n評価: 学習に使っていない配置 {EVAL_EPISODES} 回（どのモデルも同じ配置）")
+    print(f"行動の選び方: {how}")
     for s in summaries:
         print("  " + s.line())
 
-    out = RUNS_DIR / ("compare.png" if args.compare else "evaluate.png")
+    name = ("compare" if args.compare else "evaluate") + ("_greedy" if args.greedy else "")
+    out = RUNS_DIR / f"{name}.png"
     plot_summaries(summaries, out)
     print(f"\nグラフ: {out}")
 

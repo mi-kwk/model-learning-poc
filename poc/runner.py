@@ -26,10 +26,31 @@ def eval_seeds(n: int = EVAL_EPISODES) -> list[int]:
     return [EVAL_SEED_BASE + i for i in range(n)]
 
 
-def model_policy(model: PolicyNet) -> Policy:
-    """確率がいちばん高い行動を選ぶ方策。"""
+EVAL_RNG_SEED = 0  # くじ引きの乱数の種。固定しておくと、評価は何度やっても同じ結果になる
+
+
+def choose_action(probs: np.ndarray, rng: np.random.Generator, sample: bool) -> int:
+    """モデルが出した 10 個の確率から、実際に行う行動を 1 つ決める。
+
+    sample=True : 確率に従ってくじ引きで選ぶ（右上 70% なら 10 回に 7 回くらい右上）
+    sample=False: いちばん確率が高い行動を必ず選ぶ
+
+    必ず最大を選ぶと、同じ状態では同じ行動しか出ないため、
+    「何も起きない行動」や「行ったり来たり」に一度はまると抜け出せない。
+    くじ引きなら、たまに別の行動が出て抜け出せる。
+    """
+    if sample:
+        p = probs.astype(np.float64)
+        return int(rng.choice(len(p), p=p / p.sum()))
+    return int(np.argmax(probs))
+
+
+def model_policy(model: PolicyNet, sample: bool = True, seed: int = EVAL_RNG_SEED) -> Policy:
+    """学習したモデルで行動を選ぶ方策（既定はくじ引き）。"""
+    rng = np.random.default_rng(seed)
+
     def act(state: list[float]) -> int:
-        return int(np.argmax(predict_probs(model, state)))
+        return choose_action(predict_probs(model, state), rng, sample)
     return act
 
 

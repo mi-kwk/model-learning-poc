@@ -93,12 +93,17 @@ def train_policy(
     lr: float = 1e-3,
     batch_size: int = 128,
     seed: int = 0,
+    early_stop: bool = False,
     on_epoch: Callable[[int, float, float | None], None] | None = None,
 ) -> tuple[PolicyNet, dict]:
     """手本から方策ネットを学習する。
 
     1 エポック = 学習用データを一通り使って重みを更新すること。
     返り値の history に、エポックごとの学習誤差・検証誤差・検証正解率が入る。
+
+    early_stop=True のときは（既定は False）、最後まで学習を続けたうえで、
+    検証誤差がいちばん小さかったエポックの重みに戻して返す（アーリーストッピング）。
+    学習データを丸暗記して、見ていないデータに弱くなる「過学習」を避けるため。
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -123,6 +128,7 @@ def train_policy(
     yv = torch.tensor(y_va) if y_va is not None else None
 
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
+    best_epoch, best_val, best_state = epochs, float("inf"), None
     for epoch in range(1, epochs + 1):
         model.train()
         perm = torch.randperm(len(xt))
@@ -146,10 +152,17 @@ def train_policy(
                 val_acc = (logits.argmax(1) == yv).float().mean().item()
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
+            if val_loss < best_val:  # これまでで検証誤差が最小なら、その重みを控えておく
+                best_epoch, best_val = epoch, val_loss
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
         history["train_loss"].append(train_loss)
         if on_epoch:
             on_epoch(epoch, train_loss, val_loss)
 
+    used_epoch = epochs
+    if early_stop and best_state is not None:
+        model.load_state_dict(best_state)
+        used_epoch = best_epoch
     model.eval()
     info = {
         "num_demos": len(demos),
@@ -159,6 +172,11 @@ def train_policy(
         "num_val_frames": int(len(x_va)) if x_va is not None else 0,
         "demo_ids": [d.demo_id for d in demos],
         "epochs": epochs,
+        "early_stop": early_stop,
+        "used_epoch": used_epoch,                 # 実際に使った重みのエポック
+        "best_val_epoch": best_epoch if best_state is not None else None,
+        "used_val_loss": history["val_loss"][used_epoch - 1] if history["val_loss"] else None,
+        "used_val_acc": history["val_acc"][used_epoch - 1] if history["val_acc"] else None,
         "num_parameters": count_parameters(model),
         "final_train_loss": history["train_loss"][-1],
         "final_val_loss": history["val_loss"][-1] if history["val_loss"] else None,
@@ -169,7 +187,7 @@ def train_policy(
     return model, info
 
 
-def plot_history(history: dict, path: Path, title: str) -> None:
+def plot_history(history: dict, path: Path, title: str, used_epoch: int | None = None) -> None:
     """学習誤差と検証誤差のグラフを PNG に保存する。"""
     import matplotlib
     matplotlib.use("Agg")
@@ -187,6 +205,9 @@ def plot_history(history: dict, path: Path, title: str) -> None:
     ax.plot(ep, history["train_loss"], label="学習データの誤差")
     if history["val_loss"]:
         ax.plot(ep, history["val_loss"], label="検証データの誤差")
+    if used_epoch and used_epoch < len(history["train_loss"]):
+        ax.axvline(used_epoch, color="gray", linestyle="--",
+                   label=f"使った重み（エポック {used_epoch}・検証誤差が最小）")
     ax.set_xlabel("エポック（学習データを一通り使った回数）")
     ax.set_ylabel("誤差（交差エントロピー）")
     ax.set_title(title)

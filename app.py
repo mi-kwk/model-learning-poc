@@ -4,7 +4,8 @@
   1 手本モード   2 自動実行モード（model.pt）   3 ランダム行動モード
   Space 新しい配置   F 今の手本を「失敗」として保存   X 直前の手本の除外を切り替え
   P 直前の手本を再生   T 学習（すべての手本 → model.pt）   L model.pt を読み込み直す
-  E 評価（未学習の配置で 20 回）   G 最後の誤差グラフを表示   Esc 終了
+  E 評価（未学習の配置で 20 回）   G 最後の誤差グラフを表示
+  S 行動の選び方を切り替え（くじ引き ⇔ 確率が最大の行動）   + - 自動実行の速さ   Esc 終了
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import pygame
 from poc import env as E
 from poc.demos import DEFAULT_DEMO_DIR, Demo, load_demos, new_demo_id, save_demo, usable_demos
 from poc.policy import DEFAULT_MODEL, RUNS_DIR, load_model, plot_history, predict_probs, save_model, train_policy
-from poc.runner import EVAL_EPISODES, eval_seeds
+from poc.runner import EVAL_EPISODES, EVAL_RNG_SEED, choose_action, eval_seeds
 
 PANEL_W = 400
 WIN_W, WIN_H = E.FIELD_W + PANEL_W, E.FIELD_H
@@ -70,6 +71,8 @@ class App:
         self.model = None
         self.model_meta: dict = {}
         self.probs: np.ndarray | None = None
+        self.sample = True            # True: 確率に従ってくじ引き / False: 確率が最大の行動
+        self.eval_rng = np.random.default_rng(EVAL_RNG_SEED)
         self.last_action: int | None = None
         self.auto_speed = 2           # 自動実行で 1 画面あたり何コマ進めるか
         self.replay_frames: list[dict] = []
@@ -200,7 +203,7 @@ class App:
             action = int(self.rng.integers(E.NUM_ACTIONS))
         else:
             self.probs = predict_probs(self.model, state)         # 2) モデルが行動を予測する
-            action = int(np.argmax(self.probs))
+            action = choose_action(self.probs, self.rng, self.sample)  #    確率から行動を 1 つ決める
         self.last_action = action
         self.env.step(action)                                     # 3) 画面（世界）が変わる
         # 4) 次のコマでまた新しい状態を読む
@@ -223,13 +226,14 @@ class App:
         import time
         run_dir = RUNS_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_model"
         plot_path = run_dir / "loss.png"
-        plot_history(info["history"], plot_path, f"学習（手本 {len(demos)} 回）")
+        plot_history(info["history"], plot_path, f"学習（手本 {len(demos)} 回）", info["used_epoch"])
         meta = {k: v for k, v in info.items() if k != "history"}
         meta["loss_plot"] = str(plot_path)
         save_model(model, DEFAULT_MODEL, meta)
         self.try_load_model(quiet=True)   # 保存したファイルから読み込み直して使う
-        acc = info["final_val_acc"]
+        acc = info["used_val_acc"]
         self.message = (f"学習完了：手本 {len(demos)} 回・重み {info['num_parameters']} 個を調整。"
+                        f"エポック {info['used_epoch']} の重みを使用。"
                         + (f"検証の一致率 {acc * 100:.0f}%。" if acc is not None else "")
                         + " 2 で自動実行、E で評価。")
         self.show_image(plot_path)
@@ -242,6 +246,7 @@ class App:
         self.mode = MODE_EVAL
         self.eval_queue = eval_seeds(EVAL_EPISODES)
         self.eval_results = []
+        self.eval_rng = np.random.default_rng(EVAL_RNG_SEED)  # evaluate.py と同じ乱数の種で始める
         self.env.reset(self.eval_queue.pop(0))
 
     def eval_step(self) -> None:
@@ -254,14 +259,15 @@ class App:
                 self.env.reset(self.eval_queue.pop(0))
             state = self.env.state()
             self.probs = predict_probs(self.model, state)
-            self.last_action = int(np.argmax(self.probs))
+            self.last_action = choose_action(self.probs, self.eval_rng, self.sample)
             self.env.step(self.last_action)
 
     def finish_eval(self) -> None:
         ok = [s for s, _ in self.eval_results if s]
         steps = [n for s, n in self.eval_results if s]
         mean = f"{sum(steps) / len(steps):.0f}" if steps else "---"
-        self.message = (f"評価結果：成功 {len(ok)}/{len(self.eval_results)}（{len(ok) / len(self.eval_results) * 100:.0f}%）"
+        how = "くじ引き" if self.sample else "確率が最大"
+        self.message = (f"評価結果（{how}）：成功 {len(ok)}/{len(self.eval_results)}（{len(ok) / len(self.eval_results) * 100:.0f}%）"
                         f"・成功時の平均手数 {mean}。ランダム行動との比較は python evaluate.py で。")
         self.mode = MODE_AUTO
         self.paused_until_key = True
@@ -346,7 +352,7 @@ class App:
             self.text(name, (x0, yy), self.f_s, C_DIM)
             pygame.draw.rect(self.screen, (60, 66, 78), (x0 + 60, yy + 3, w - 110, 12))
             if probs is not None:
-                top = int(np.argmax(probs)) == i
+                top = self.last_action == i   # 実際に選ばれた行動を黄色で示す
                 pygame.draw.rect(self.screen, C_BAR_TOP if top else C_BAR,
                                  (x0 + 60, yy + 3, int((w - 110) * float(probs[i])), 12))
                 self.text(f"{probs[i] * 100:4.0f}%", (x0 + w - 44, yy), self.f_s, C_DIM)
@@ -356,6 +362,8 @@ class App:
         y += 10 * 19 + 6
 
         meta = self.model_meta
+        y = self.text("選び方: " + ("くじ引き（確率に従う）" if self.sample else "確率が最大の行動"),
+                      (x0, y), self.f_s, C_DIM)
         if self.model is not None:
             y = self.text(f"model.pt: 手本 {meta.get('num_demos', '?')} 回 / 重み {meta.get('num_parameters', '?')} 個",
                           (x0, y), self.f_s, C_DIM)
@@ -365,7 +373,7 @@ class App:
         y += 6
         y = self.wrap(self.message, (x0, y), w, self.f_s, C_BAR_TOP)
         keys = ("1 手本  2 自動  3 ランダム  Space 新配置  F 失敗で保存  X 除外  "
-                "P 再生  T 学習  L 読込  E 評価  G グラフ  Esc 終了")
+                "P 再生  T 学習  L 読込  E 評価  G グラフ  S 選び方  Esc 終了")
         self.wrap(keys, (x0, WIN_H - 58), w, self.f_s, C_DIM)
 
     def draw_progress(self, title: str, ratio: float, sub: str) -> None:
@@ -419,6 +427,10 @@ class App:
             self.train()
         elif key == pygame.K_l:
             self.try_load_model()
+        elif key == pygame.K_s:
+            self.sample = not self.sample
+            self.message = ("行動の選び方：確率に従ってくじ引き" if self.sample
+                            else "行動の選び方：確率が最大の行動を必ず選ぶ")
         elif key == pygame.K_e:
             self.start_eval()
         elif key == pygame.K_g:
