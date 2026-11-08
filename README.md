@@ -66,7 +66,7 @@ py -3.12 -m venv .venv
 | `models/` | 学習したモデル |
 | `runs/` | 誤差グラフ・評価グラフ |
 
-`data/` `models/` `runs/` は git の管理対象外にしています。手本を残したい場合は `.gitignore` から `data/demos/` を外してください。
+`data/` `models/` `runs/` は git の管理対象外にしています。データ形式の見本として、合成の手本 5 回分だけを `samples/demos/` に入れています（[samples/README.md](samples/README.md)）。手本を残したい場合は `.gitignore` から `data/demos/` を外してください。
 
 ## 動作確認用の合成手本（任意）
 
