@@ -2,6 +2,7 @@
 
 キー操作:
   1 手本モード   2 自動実行モード（model.pt）   3 ランダム行動モード
+  4 画像から自動実行（段階 2：vision.pt で画像を見て → model.pt で行動）
   Space 新しい配置   F 今の手本を「失敗」として保存   X 直前の手本の除外を切り替え
   P 直前の手本を再生   T 学習（すべての手本 → model.pt）   L model.pt を読み込み直す
   E 評価（未学習の配置で 20 回）   G 最後の誤差グラフを表示
@@ -18,7 +19,9 @@ import pygame
 from poc import env as E
 from poc.demos import DEFAULT_DEMO_DIR, Demo, load_demos, new_demo_id, save_demo, usable_demos
 from poc.policy import DEFAULT_MODEL, RUNS_DIR, load_model, plot_history, predict_probs, save_model, train_policy
+from poc.render import IMG_SIZE, draw_scene, render_image
 from poc.runner import EVAL_EPISODES, EVAL_RNG_SEED, choose_action, eval_seeds
+from poc.vision import VISION_MODEL, load_vision, predict_state, state_error_px
 
 PANEL_W = 400
 WIN_W, WIN_H = E.FIELD_W + PANEL_W, E.FIELD_H
@@ -37,12 +40,14 @@ C_BAR = (90, 150, 240)
 C_BAR_TOP = (250, 190, 60)
 
 MODE_DEMO, MODE_AUTO, MODE_RANDOM, MODE_REPLAY, MODE_EVAL = "demo", "auto", "random", "replay", "eval"
+MODE_VISION = "vision"
 MODE_LABEL = {
     MODE_DEMO: "手本モード（マウスで箱をドラッグ）",
     MODE_AUTO: "自動実行モード（model.pt が操作）",
     MODE_RANDOM: "ランダム行動モード（比較用）",
     MODE_REPLAY: "手本の再生（記録の確認）",
     MODE_EVAL: "評価中（未学習の配置で 20 回）",
+    MODE_VISION: "画像から自動実行（段階 2）",
 }
 
 
@@ -70,6 +75,11 @@ class App:
         self.message = "手本モードです。箱をドラッグして緑の置き場へ運んでください。"
         self.model = None
         self.model_meta: dict = {}
+        self.vision = None
+        self.vision_meta: dict = {}
+        self.est_state: list[float] | None = None   # 見るモデルが画像から推定した状態
+        self.vision_img: np.ndarray | None = None   # 見るモデルに渡した画像
+        self.eval_vision = False
         self.probs: np.ndarray | None = None
         self.sample = True            # True: 確率に従ってくじ引き / False: 確率が最大の行動
         self.eval_rng = np.random.default_rng(EVAL_RNG_SEED)
@@ -86,6 +96,7 @@ class App:
         self.refresh_counts()
 
         self.try_load_model(quiet=True)
+        self.try_load_vision()
         self.new_layout()
 
     # ---- 準備 --------------------------------------------------------------
@@ -95,6 +106,8 @@ class App:
         self.env.reset(seed)
         self.probs = None
         self.last_action = None
+        self.est_state = None
+        self.vision_img = None
         self.paused_until_key = False
         if self.mode == MODE_DEMO:
             self.demo = Demo(demo_id="", seed=seed)
@@ -117,8 +130,17 @@ class App:
             if not quiet:
                 self.message = "model.pt がまだありません。T で学習してください。"
 
+    def try_load_vision(self) -> None:
+        if VISION_MODEL.exists():
+            self.vision, self.vision_meta = load_vision()
+        else:
+            self.vision = None
+
     def set_mode(self, mode: str) -> None:
-        if mode == MODE_AUTO and self.model is None:
+        if mode == MODE_VISION and self.vision is None:
+            self.message = "vision.pt がまだありません。python train_vision.py で見るモデルを学習してください。"
+            return
+        if mode in (MODE_AUTO, MODE_VISION) and self.model is None:
             self.message = "model.pt がまだありません。手本を記録して T で学習してください。"
             return
         self.mode = mode
@@ -197,7 +219,7 @@ class App:
     def auto_step(self) -> None:
         if self.env.done or self.env.steps >= E.MAX_STEPS:
             return
-        state = self.env.state()                                  # 1) 今の状態を読む
+        state = self.observe()                                    # 1) 今の状態を読む（段階 2 は画像から）
         if self.mode == MODE_RANDOM:
             self.probs = np.full(E.NUM_ACTIONS, 1 / E.NUM_ACTIONS)
             action = int(self.rng.integers(E.NUM_ACTIONS))
@@ -207,6 +229,16 @@ class App:
         self.last_action = action
         self.env.step(action)                                     # 3) 画面（世界）が変わる
         # 4) 次のコマでまた新しい状態を読む
+
+    def observe(self, vision: bool | None = None) -> list[float]:
+        """状態を知る。段階 1 は正確な座標、段階 2 は画像を見るモデルの推定。"""
+        if vision is None:
+            vision = self.mode == MODE_VISION
+        if not vision:
+            return self.env.state()
+        self.vision_img = render_image(self.env)                   # カメラ画像の代わり
+        self.est_state = predict_state(self.vision, self.vision_img)
+        return self.est_state
 
     # ---- 学習 --------------------------------------------------------------
     def train(self) -> None:
@@ -243,6 +275,7 @@ class App:
         if self.model is None:
             self.message = "model.pt がまだありません。T で学習してください。"
             return
+        self.eval_vision = self.mode == MODE_VISION and self.vision is not None
         self.mode = MODE_EVAL
         self.eval_queue = eval_seeds(EVAL_EPISODES)
         self.eval_results = []
@@ -257,7 +290,7 @@ class App:
                     self.finish_eval()
                     return
                 self.env.reset(self.eval_queue.pop(0))
-            state = self.env.state()
+            state = self.observe(self.eval_vision)
             self.probs = predict_probs(self.model, state)
             self.last_action = choose_action(self.probs, self.eval_rng, self.sample)
             self.env.step(self.last_action)
@@ -266,10 +299,10 @@ class App:
         ok = [s for s, _ in self.eval_results if s]
         steps = [n for s, n in self.eval_results if s]
         mean = f"{sum(steps) / len(steps):.0f}" if steps else "---"
-        how = "くじ引き" if self.sample else "確率が最大"
+        how = ("画像から・" if self.eval_vision else "") + ("くじ引き" if self.sample else "確率が最大")
         self.message = (f"評価結果（{how}）：成功 {len(ok)}/{len(self.eval_results)}（{len(ok) / len(self.eval_results) * 100:.0f}%）"
                         f"・成功時の平均手数 {mean}。ランダム行動との比較は python evaluate.py で。")
-        self.mode = MODE_AUTO
+        self.mode = MODE_VISION if self.eval_vision else MODE_AUTO
         self.paused_until_key = True
 
     # ---- 描画 --------------------------------------------------------------
@@ -297,17 +330,23 @@ class App:
         return y
 
     def draw_field(self) -> None:
-        pygame.draw.rect(self.screen, C_FIELD, (0, 0, E.FIELD_W, E.FIELD_H))
+        draw_scene(self.screen.subsurface((0, 0, E.FIELD_W, E.FIELD_H)), self.env)  # 見るモデルの画像と同じ描き方
         t = E.TARGET_SIZE
         tx, ty = self.env.target
-        pygame.draw.rect(self.screen, C_TARGET, (tx - t / 2, ty - t / 2, t, t), 4, border_radius=6)
         self.text("置き場", (tx - 22, ty - t / 2 - 22), self.f_s, C_TARGET)
-        b = E.BOX_SIZE
-        bx, by = self.env.box
-        pygame.draw.rect(self.screen, C_BOX, (bx - b / 2, by - b / 2, b, b), border_radius=4)
-        cx, cy = self.env.cursor
-        pygame.draw.circle(self.screen, C_HAND, (int(cx), int(cy)), 9 if self.env.holding else 7,
-                           0 if self.env.holding else 3)
+        if self.est_state is not None and self.mode in (MODE_VISION, MODE_EVAL):
+            # 見るモデルが「ここにある」と推定した位置を × で重ねる
+            for k in range(3):
+                ex = (self.est_state[2 * k] + 1) / 2 * E.FIELD_W
+                ey = (self.est_state[2 * k + 1] + 1) / 2 * E.FIELD_H
+                pygame.draw.line(self.screen, (0, 0, 0), (ex - 7, ey - 7), (ex + 7, ey + 7), 2)
+                pygame.draw.line(self.screen, (0, 0, 0), (ex - 7, ey + 7), (ex + 7, ey - 7), 2)
+        if self.vision_img is not None and self.mode in (MODE_VISION, MODE_EVAL):
+            thumb = pygame.surfarray.make_surface(self.vision_img.transpose(1, 0, 2))
+            top = E.FIELD_H - IMG_SIZE - 30
+            pygame.draw.rect(self.screen, C_PANEL, (6, top, IMG_SIZE + 8, IMG_SIZE + 26))
+            self.screen.blit(thumb, (10, top + 22))
+            self.text("見るモデルへの入力", (10, top + 2), self.f_s, C_TEXT)
         if self.mode == MODE_DEMO:
             mx, my = pygame.mouse.get_pos()
             if mx < E.FIELD_W:
@@ -336,13 +375,25 @@ class App:
 
         # 入力（状態）
         y += 8
-        y = self.text("入力：状態（7 つの数値、-1〜1 に正規化）", (x0, y), self.f_m)
         s = self.env.state()
-        for i, name in enumerate(E.STATE_NAMES):
-            col = i % 2
-            yy = y + (i // 2) * 18
-            self.text(f"{name}: {s[i]:+.2f}", (x0 + col * 180, yy), self.f_s, C_DIM)
-        y += 4 * 18 + 6
+        est = self.est_state if self.mode in (MODE_VISION, MODE_EVAL) else None
+        if est is None:
+            y = self.text("入力：状態（7 つの数値、-1〜1 に正規化）", (x0, y), self.f_m)
+            for i, name in enumerate(E.STATE_NAMES):
+                col = i % 2
+                yy = y + (i // 2) * 18
+                self.text(f"{name}: {s[i]:+.2f}", (x0 + col * 180, yy), self.f_s, C_DIM)
+            y += 4 * 18 + 6
+        else:
+            y = self.text("入力：画像から推定した 7 つの数値（正解）", (x0, y), self.f_m)
+            for i, name in enumerate(E.STATE_NAMES):
+                col = i % 2
+                yy = y + (i // 2) * 18
+                self.text(f"{name}: {est[i]:+.2f}（{s[i]:+.2f}）", (x0 + col * 180, yy), self.f_s, C_DIM)
+            y += 4 * 18
+            err = state_error_px(est, s)
+            y = self.text(f"見間違い: カーソル {err[0]:.0f}px 箱 {err[1]:.0f}px 置き場 {err[2]:.0f}px",
+                          (x0, y), self.f_s, C_BAR_TOP) + 2
 
         # 出力（行動）
         y = self.text("出力：10 個の行動の確率", (x0, y), self.f_m)
@@ -364,6 +415,9 @@ class App:
         meta = self.model_meta
         y = self.text("選び方: " + ("くじ引き（確率に従う）" if self.sample else "確率が最大の行動"),
                       (x0, y), self.f_s, C_DIM)
+        if self.vision is not None:
+            y = self.text(f"vision.pt: 画像 {self.vision_meta.get('num_images', '?')} 枚 / "
+                          f"重み {self.vision_meta.get('num_parameters', 0):,} 個", (x0, y), self.f_s, C_DIM)
         if self.model is not None:
             y = self.text(f"model.pt: 手本 {meta.get('num_demos', '?')} 回 / 重み {meta.get('num_parameters', '?')} 個",
                           (x0, y), self.f_s, C_DIM)
@@ -372,9 +426,9 @@ class App:
 
         y += 6
         y = self.wrap(self.message, (x0, y), w, self.f_s, C_BAR_TOP)
-        keys = ("1 手本  2 自動  3 ランダム  Space 新配置  F 失敗で保存  X 除外  "
+        keys = ("1 手本  2 自動  3 ランダム  4 画像から  Space 新配置  F 失敗で保存  X 除外  "
                 "P 再生  T 学習  L 読込  E 評価  G グラフ  S 選び方  Esc 終了")
-        self.wrap(keys, (x0, WIN_H - 58), w, self.f_s, C_DIM)
+        self.wrap(keys, (x0, WIN_H - 66), w, self.f_s, C_DIM)
 
     def draw_progress(self, title: str, ratio: float, sub: str) -> None:
         self.draw()
@@ -412,6 +466,8 @@ class App:
             self.set_mode(MODE_AUTO)
         elif key == pygame.K_3:
             self.set_mode(MODE_RANDOM)
+        elif key == pygame.K_4:
+            self.set_mode(MODE_VISION)
         elif key == pygame.K_SPACE:
             if self.mode in (MODE_REPLAY, MODE_EVAL):
                 self.mode = MODE_DEMO
@@ -427,6 +483,7 @@ class App:
             self.train()
         elif key == pygame.K_l:
             self.try_load_model()
+            self.try_load_vision()
         elif key == pygame.K_s:
             self.sample = not self.sample
             self.message = ("行動の選び方：確率に従ってくじ引き" if self.sample
@@ -457,7 +514,7 @@ class App:
             if self.overlay is None:
                 if self.mode == MODE_DEMO:
                     self.demo_step()
-                elif self.mode in (MODE_AUTO, MODE_RANDOM) and not self.paused_until_key:
+                elif self.mode in (MODE_AUTO, MODE_RANDOM, MODE_VISION) and not self.paused_until_key:
                     for _ in range(self.auto_speed):
                         self.auto_step()
                     if self.env.done or self.env.steps >= E.MAX_STEPS:

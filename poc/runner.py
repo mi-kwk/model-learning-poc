@@ -84,15 +84,28 @@ class EpisodeResult:
     steps: int
 
 
+Observer = Callable[[BoxEnv], list[float]]
+
+
+def true_state(env: BoxEnv) -> list[float]:
+    """段階 1：プログラムが知っている正確な座標をそのまま状態にする。"""
+    return env.state()
+
+
 def run_episode(policy: Policy, seed: int, max_steps: int = MAX_STEPS,
-                on_step: Callable[[BoxEnv, int], bool] | None = None) -> EpisodeResult:
-    """1 回分を最後まで動かす。on_step を渡すと 1 コマごとに呼ばれる（画面描画用）。"""
+                on_step: Callable[[BoxEnv, int], bool] | None = None,
+                observe: Observer = true_state) -> EpisodeResult:
+    """1 回分を最後まで動かす。on_step を渡すと 1 コマごとに呼ばれる（画面描画用）。
+
+    observe は「状態をどうやって知るか」。段階 1 は正確な座標、
+    段階 2 は画像を見るモデルの推定値（poc.vision.vision_observer）。
+    """
     env = BoxEnv()
-    state = env.reset(seed)
+    env.reset(seed)
     while env.steps < max_steps and not env.done:
+        state = observe(env)            # 状態を知る（段階 2 では画像から推定）
         action = policy(state)          # 状態 → 行動の予測
         env.step(action)                # 世界が 1 コマ進む
-        state = env.state()             # 新しい状態
         if on_step and on_step(env, action) is False:
             break
     return EpisodeResult(seed, env.success, env.steps)
@@ -119,5 +132,6 @@ class EvalSummary:
                 f" （成功率 {self.success_rate * 100:5.1f}%） 成功時の平均手数 {ms_text}")
 
 
-def evaluate(name: str, policy: Policy, n: int = EVAL_EPISODES) -> EvalSummary:
-    return EvalSummary(name, [run_episode(policy, s) for s in eval_seeds(n)])
+def evaluate(name: str, policy: Policy, n: int = EVAL_EPISODES,
+             observe: Observer = true_state) -> EvalSummary:
+    return EvalSummary(name, [run_episode(policy, s, observe=observe) for s in eval_seeds(n)])

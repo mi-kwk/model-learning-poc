@@ -3,12 +3,15 @@
 使い方:
   python evaluate.py                    # models/model.pt とランダム行動を比べる
   python evaluate.py --compare          # models/model_n*.pt（手本 5/20/50 回など）とランダム行動を比べる
+  python evaluate.py --vision           # 段階 2：正確な座標で動く場合と、画像を見て動く場合を比べる
 """
 from __future__ import annotations
 
 import argparse
 import re
 from pathlib import Path
+
+import numpy as np
 
 from poc.policy import DEFAULT_MODEL, MODEL_DIR, RUNS_DIR, load_model
 from poc.runner import EVAL_EPISODES, evaluate, model_policy, random_policy
@@ -49,6 +52,51 @@ def plot_summaries(summaries, path: Path) -> None:
     plt.close(fig)
 
 
+def evaluate_vision(args) -> None:
+    """段階 1（正確な座標）と段階 2（画像 → 見るモデル → 動くモデル）を同じ 20 配置で比べる。"""
+    from poc.vision import VISION_MODEL, load_vision, state_error_px, vision_observer
+
+    for p, cmd in [(args.model, "python train.py"), (VISION_MODEL, "python train_vision.py")]:
+        if not p.exists():
+            print(f"{p} がありません。先に {cmd} を実行してください。")
+            return
+    policy_model, meta = load_model(args.model)
+    vision, vmeta = load_vision(VISION_MODEL)
+    sample = not args.greedy
+
+    # 自動実行中の「見間違い」の大きさも記録する
+    errors: list[list[float]] = []
+    hold_miss = [0, 0]
+    see = vision_observer(vision)
+
+    def observe(env):
+        est = see(env)
+        true = env.state()
+        errors.append(state_error_px(est, true))
+        hold_miss[0] += int(est[6] != true[6])
+        hold_miss[1] += 1
+        return est
+
+    summaries = [
+        evaluate("ランダム行動", random_policy(seed=0)),
+        evaluate("段階1:正確な座標", model_policy(policy_model, sample=sample)),
+        evaluate("段階2:画像から", model_policy(policy_model, sample=sample), observe=observe),
+    ]
+    how = "確率が最大の行動を選ぶ" if args.greedy else "確率に従ってくじ引き（乱数の種は固定）"
+    print(f"\n評価: 学習に使っていない配置 {EVAL_EPISODES} 回（どれも同じ配置）")
+    print(f"動くモデル: {args.model.name}（手本 {meta.get('num_demos', '?')} 回）/ "
+          f"見るモデル: vision.pt（画像 {vmeta.get('num_images', '?')} 枚）/ 行動の選び方: {how}")
+    for s in summaries:
+        print("  " + s.line())
+    e = np.array(errors)
+    print(f"\n段階2 の自動実行中の見間違い（{len(e)} コマの平均）: "
+          f"カーソル {e[:, 0].mean():.1f}px / 箱 {e[:, 1].mean():.1f}px / 置き場 {e[:, 2].mean():.1f}px、"
+          f"つかみの見間違い {hold_miss[0]}/{hold_miss[1]} コマ")
+    out = RUNS_DIR / ("vision_compare" + ("_greedy" if args.greedy else "") + ".png")
+    plot_summaries(summaries, out)
+    print(f"\nグラフ: {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="モデルを未学習の配置で評価する")
     ap.add_argument("--compare", action="store_true", help="models/model_n*.pt をまとめて比べる")
@@ -56,7 +104,13 @@ def main() -> None:
     ap.add_argument("--model-dir", type=Path, default=MODEL_DIR, help="--compare で探すフォルダ")
     ap.add_argument("--greedy", action="store_true",
                     help="くじ引きではなく、確率が最大の行動を必ず選ぶ（比較用）")
+    ap.add_argument("--vision", action="store_true",
+                    help="段階 2：正確な座標で動く場合と、画像を見て動く場合（vision.pt → model.pt）を比べる")
     args = ap.parse_args()
+
+    if args.vision:
+        evaluate_vision(args)
+        return
 
     if args.compare:
         paths = sorted(args.model_dir.glob("model_n*.pt"),
